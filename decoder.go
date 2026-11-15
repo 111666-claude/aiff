@@ -349,6 +349,11 @@ func (d *Decoder) FullPCMBuffer() (*audio.IntBuffer, error) {
 
 		if leftOverSize := d.PCMChunk.Size - d.PCMChunk.Pos; leftOverSize < chunkSize {
 			sizeToRead = leftOverSize
+			// AIFF chunks are padded to an even byte count, an incomplete
+			// trailing sample is padding and isn't part of the audio data.
+			if adjust := sizeToRead % bytesPerSample(buf.SourceBitDepth); adjust != 0 {
+				sizeToRead -= adjust
+			}
 		}
 		if sizeToRead < 1 {
 			break
@@ -420,32 +425,32 @@ func (d *Decoder) PCMBuffer(buf *audio.IntBuffer) (n int, err error) {
 	size := len(buf.Data) * bPerSample
 	tmpBuf := make([]byte, size)
 	var m int
-	m, err = d.PCMChunk.R.Read(tmpBuf)
+	m, err = io.ReadFull(d.PCMChunk, tmpBuf)
 	if err != nil {
 		if err == io.EOF {
-			return m, nil
+			return 0, nil
 		}
-		return m, err
+		if err != io.ErrUnexpectedEOF {
+			return m, err
+		}
+		// the chunk is exhausted, an incomplete trailing sample is the
+		// AIFF chunk padding and isn't audio data.
+		if adjust := m % bPerSample; adjust != 0 {
+			m -= adjust
+		}
+		err = nil
 	}
 	if m == 0 {
-		return m, nil
+		return 0, err
 	}
 	bufR := bytes.NewReader(tmpBuf[:m])
 	sampleBuf := make([]byte, bPerSample, bPerSample)
-	var misaligned bool
-	if m%bPerSample > 0 {
-		misaligned = true
-	}
 
 	// Note that we populate the buffer even if the
 	// size of the buffer doesn't fit an even number of frames.
 	for n = 0; n < len(buf.Data); n++ {
 		buf.Data[n], err = decodeF(bufR, sampleBuf)
 		if err != nil {
-			// the last sample isn't a full sample but just padding.
-			if misaligned {
-				n--
-			}
 			break
 		}
 	}
