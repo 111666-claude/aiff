@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"io/ioutil"
 )
 
 // parseChunk processes a chunk and stores the valuable information
@@ -38,7 +37,12 @@ func (d *Decoder) parseChunk(chunk *Chunk) error {
 	// Comments Chunk
 	case COMTID:
 		if err := d.parseCommentsChunk(chunk); err != nil {
-			fmt.Println("failed to read comments", err)
+			return err
+		}
+	// Markers Chunk
+	case MARKID:
+		if err := d.parseMarkersChunk(chunk); err != nil {
+			return err
 		}
 	// Apple/Logic specific chunk
 	case bascID:
@@ -89,32 +93,106 @@ func (d *Decoder) parseChunk(chunk *Chunk) error {
 	return nil
 }
 
-// parseCommentsChunk processes the comments chunk and adds comments as strings
-// to the decoder and drains the chunk.
+// parseCommentsChunk processes the comments chunk, stores the comment texts
+// on the decoder as strings as well as the full comment entries (timestamp,
+// associated marker ID, text) and drains the chunk.
 func (d *Decoder) parseCommentsChunk(chunk *Chunk) error {
 	if chunk.ID != COMTID {
 		return fmt.Errorf("unexpected comments chunk ID: %q", chunk.ID)
 	}
 
 	br := bytes.NewBuffer(make([]byte, 0, chunk.Size))
-	var n int64
-	n, d.err = io.CopyN(br, d.r, int64(chunk.Size))
-	if d.err != nil {
-		return d.err
-	}
-	if n < int64(chunk.Size) {
-		br.Truncate(int(n))
+	if _, err := io.CopyN(br, chunk.R, int64(chunk.Size)); err != nil {
+		return fmt.Errorf("truncated COMT chunk - %v", err)
 	}
 
 	var nbrComments uint16
-	binary.Read(br, binary.BigEndian, &nbrComments)
+	if err := binary.Read(br, binary.BigEndian, &nbrComments); err != nil {
+		return fmt.Errorf("truncated COMT chunk (comment count) - %v", err)
+	}
 	for i := 0; i < int(nbrComments); i++ {
-		// TODO extract marker id and timestamp
-		io.CopyN(ioutil.Discard, br, 8) // equivalent of br.Seek(8, io.SeekCurrent) but bytes buffer doesn't implement seek
-		b, _ := br.ReadByte()
-		textB := make([]byte, int(b))
-		br.Read(textB)
-		d.Comments = append(d.Comments, string(bytes.TrimRight(textB, "\x00")))
+		var (
+			timestamp uint32
+			markerID  int16
+			count     uint16
+		)
+		if err := binary.Read(br, binary.BigEndian, &timestamp); err != nil {
+			return fmt.Errorf("truncated COMT chunk (comment %d timestamp) - %v", i, err)
+		}
+		if err := binary.Read(br, binary.BigEndian, &markerID); err != nil {
+			return fmt.Errorf("truncated COMT chunk (comment %d marker ID) - %v", i, err)
+		}
+		if err := binary.Read(br, binary.BigEndian, &count); err != nil {
+			return fmt.Errorf("truncated COMT chunk (comment %d text length) - %v", i, err)
+		}
+		if br.Len() < int(count) {
+			return fmt.Errorf("truncated COMT chunk (comment %d text: %d bytes announced, %d available)", i, count, br.Len())
+		}
+		text := string(bytes.TrimRight(br.Next(int(count)), "\x00"))
+		if markerID != 0 && !d.hasMarkerID(markerID) {
+			return fmt.Errorf("%w: %d", ErrUnknownMarkerID, markerID)
+		}
+		d.CommentDetails = append(d.CommentDetails, Comment{
+			Timestamp: timestamp,
+			MarkerID:  markerID,
+			Text:      text,
+		})
+		d.Comments = append(d.Comments, text)
+	}
+
+	return nil
+}
+
+// parseMarkersChunk processes the markers chunk and stores the markers
+// on the decoder and drains the chunk.
+func (d *Decoder) parseMarkersChunk(chunk *Chunk) error {
+	if chunk.ID != MARKID {
+		return fmt.Errorf("unexpected markers chunk ID: %q", chunk.ID)
+	}
+
+	br := bytes.NewBuffer(make([]byte, 0, chunk.Size))
+	if _, err := io.CopyN(br, chunk.R, int64(chunk.Size)); err != nil {
+		return fmt.Errorf("truncated MARK chunk - %v", err)
+	}
+
+	var nbrMarkers uint16
+	if err := binary.Read(br, binary.BigEndian, &nbrMarkers); err != nil {
+		return fmt.Errorf("truncated MARK chunk (marker count) - %v", err)
+	}
+	seen := make(map[int16]bool, nbrMarkers)
+	for i := 0; i < int(nbrMarkers); i++ {
+		var (
+			id         int16
+			position   uint32
+			nameLength uint8
+		)
+		if err := binary.Read(br, binary.BigEndian, &id); err != nil {
+			return fmt.Errorf("truncated MARK chunk (marker %d ID) - %v", i, err)
+		}
+		if err := binary.Read(br, binary.BigEndian, &position); err != nil {
+			return fmt.Errorf("truncated MARK chunk (marker %d position) - %v", i, err)
+		}
+		if err := binary.Read(br, binary.BigEndian, &nameLength); err != nil {
+			return fmt.Errorf("truncated MARK chunk (marker %d name length) - %v", i, err)
+		}
+		if br.Len() < int(nameLength) {
+			return fmt.Errorf("truncated MARK chunk (marker %d name: %d bytes announced, %d available)", i, nameLength, br.Len())
+		}
+		name := string(br.Next(int(nameLength)))
+		if (1+int(nameLength))%2 != 0 && br.Len() > 0 {
+			// Pascal strings are padded to an even number of bytes
+			br.Next(1)
+		}
+		if seen[id] {
+			return fmt.Errorf("%w: %d", ErrDuplicateMarkerID, id)
+		}
+		seen[id] = true
+		// only check the position against the sound data size if the COMM
+		// chunk was already parsed.
+		if d.commSize > 0 && position > d.NumSampleFrames {
+			return fmt.Errorf("%w: marker %d is at frame %d but the file only has %d frames", ErrMarkerPositionOutOfRange, id, position, d.NumSampleFrames)
+		}
+		d.Markers = append(d.Markers, Marker{ID: id, Position: position, Name: name})
 	}
 
 	return nil

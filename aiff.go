@@ -9,6 +9,8 @@ var (
 	// COMMID is the common chunk ID
 	COMMID = [4]byte{'C', 'O', 'M', 'M'}
 	COMTID = [4]byte{'C', 'O', 'M', 'T'}
+	// MARKID is the marker chunk ID
+	MARKID = [4]byte{'M', 'A', 'R', 'K'}
 	SSNDID = [4]byte{'S', 'S', 'N', 'D'}
 
 	// Apple stuff

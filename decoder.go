@@ -39,7 +39,14 @@ type Decoder struct {
 	PCMSize  uint32
 	PCMChunk *Chunk
 	//
+	// Comments contains the text of the comments found in the COMT chunk.
 	Comments []string
+	// CommentDetails contains the full COMT chunk entries (timestamp,
+	// associated marker ID and text), in the order they appear in the file.
+	CommentDetails []Comment
+	// Markers contains the entries of the MARK chunk, in the order they
+	// appear in the file.
+	Markers []Marker
 
 	// AIFC data
 	Encoding     [4]byte

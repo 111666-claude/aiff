@@ -21,6 +21,10 @@ type Encoder struct {
 	frames          int
 	pcmChunkStarted bool
 	pcmChunkSizePos int
+
+	markers           []Marker
+	comments          []Comment
+	metaChunksWritten bool
 }
 
 // NewEncoder creates a new encoder to create a new aiff file.
@@ -140,6 +144,10 @@ func (e *Encoder) Write(buf *audio.IntBuffer) error {
 	if err := e.writeHeader(); err != nil {
 		return err
 	}
+	// MARK/COMT chunks live between the COMM and SSND chunks
+	if err := e.writeMetaChunks(); err != nil {
+		return err
+	}
 
 	if !e.pcmChunkStarted {
 		// other chunks
@@ -171,6 +179,13 @@ func (e *Encoder) Write(buf *audio.IntBuffer) error {
 // Close flushes the content to disk, make sure the headers are up to date
 // Note that the underlying writter is NOT being closed.
 func (e *Encoder) Close() error {
+	// now that the total number of frames is known, make sure no marker
+	// points beyond the end of the sound data.
+	for _, m := range e.markers {
+		if m.Position > uint32(e.frames) {
+			return fmt.Errorf("%w: marker %d is at frame %d but only %d frames were written", ErrMarkerPositionOutOfRange, m.ID, m.Position, e.frames)
+		}
+	}
 	// go back and write total size
 	if _, err := e.w.Seek(4, 0); err != nil {
 		return err
