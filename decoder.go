@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"math"
 	"os"
 	"time"
 
@@ -166,8 +167,11 @@ func (d *Decoder) IsValidFile() bool {
 		return false
 	}
 	switch d.Encoding {
-	case encSowt, encNone, encNotSet:
+	case encSowt, encNone, encNotSet, encFl32, encFL32:
 	default:
+		return false
+	}
+	if isFloatEncoding(d.Encoding) && d.BitDepth != 32 {
 		return false
 	}
 
@@ -250,13 +254,19 @@ func (d *Decoder) FwdToPCM() error {
 				d.err = fmt.Errorf("PCM offset failed to parse - %s", d.err)
 				return d.err
 			}
-
-			if d.err = chunk.ReadBE(&d.PCMSize); d.err != nil {
-				d.err = fmt.Errorf("PCMSize failed to parse - %s", d.err)
+			var blockSize uint32
+			if d.err = chunk.ReadBE(&blockSize); d.err != nil {
+				d.err = fmt.Errorf("PCM block size failed to parse - %s", d.err)
 				return d.err
 			}
+			// the chunk size covers the offset, the block size and the
+			// sample data.
+			if int64(chunk.Size)-8-int64(offset) < 0 {
+				d.err = fmt.Errorf("%w: invalid SSND offset %d for a chunk of %d bytes", ErrUnexpectedData, offset, chunk.Size)
+				return d.err
+			}
+			d.PCMSize = uint32(int64(chunk.Size) - 8 - int64(offset))
 			if offset > 0 {
-				d.PCMSize -= offset
 				// skip pcm comment
 				buf := make([]byte, offset)
 				if err := chunk.ReadBE(&buf); err != nil {
@@ -291,8 +301,12 @@ func (d *Decoder) Reset() {
 	d.SampleRate = 0
 	d.Encoding = [4]byte{}
 	d.EncodingName = ""
+	d.PCMSize = 0
+	d.PCMChunk = nil
 	d.err = nil
 	d.pcmDataAccessed = false
+	d.byteOrder = binary.BigEndian
+	d.rewindBytes = 0
 	d.r.Seek(0, 0)
 }
 
@@ -317,6 +331,9 @@ func (d *Decoder) FullPCMBuffer() (*audio.IntBuffer, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to forward to PCM: %v", err)
 		}
+	}
+	if d.isFloatEncoding() {
+		return nil, ErrFloatPCMIntBuffer
 	}
 	format := &audio.Format{
 		NumChannels: int(d.NumChans),
@@ -390,16 +407,20 @@ func (d *Decoder) FullPCMBuffer() (*audio.IntBuffer, error) {
 
 // PCMBuffer populates the passed PCM buffer and returns the number of samples
 // read and a potential error. If the reader reaches EOF, an io.EOF error will be returned.
+// If the container stores floating point samples (fl32/FL32), an
+// ErrFloatPCMIntBuffer error is returned: use PCMFloatBuffer instead.
 func (d *Decoder) PCMBuffer(buf *audio.IntBuffer) (n int, err error) {
 	if buf == nil {
 		return 0, nil
 	}
-
 	if !d.WasPCMAccessed() {
 		err = d.FwdToPCM()
 		if err != nil {
 			return 0, err
 		}
+	}
+	if d.isFloatEncoding() {
+		return 0, ErrFloatPCMIntBuffer
 	}
 
 	// TODO: avoid a potentially unecessary allocation
@@ -455,6 +476,144 @@ func (d *Decoder) PCMBuffer(buf *audio.IntBuffer) (n int, err error) {
 	}
 
 	return n, err
+}
+
+// FullPCMFloatBuffer loads the entire PCM content of the container into a
+// float buffer. Samples of fl32/FL32 containers are returned verbatim; samples
+// of integer containers are converted to float without normalization.
+// Consider using PCMFloatBuffer instead when the content is large.
+func (d *Decoder) FullPCMFloatBuffer() (*audio.FloatBuffer, error) {
+	if d == nil {
+		return nil, errors.New("can't decode a nil decoder")
+	}
+	if !d.WasPCMAccessed() {
+		if err := d.FwdToPCM(); err != nil {
+			return nil, fmt.Errorf("failed to forward to PCM: %v", err)
+		}
+	}
+	if d.NumChans < 1 {
+		return nil, fmt.Errorf("%w: invalid number of channels %d", ErrUnexpectedData, d.NumChans)
+	}
+
+	buf := &audio.FloatBuffer{
+		Format: &audio.Format{
+			NumChannels: int(d.NumChans),
+			SampleRate:  int(d.SampleRate),
+		},
+	}
+	// grow the buffer in blocks to avoid many small reallocations.
+	block := 2048 * int(d.NumChans)
+	buf.Data = make([]float64, 0, block)
+	tmp := make([]float64, block)
+	for {
+		n, err := d.PCMFloatBuffer(&audio.FloatBuffer{Format: buf.Format, Data: tmp})
+		buf.Data = append(buf.Data, tmp[:n]...)
+		if err != nil {
+			// the samples decoded so far are still returned, the caller can
+			// inspect the error to know what stopped the decoding.
+			return buf, err
+		}
+		if n < len(tmp) {
+			break
+		}
+	}
+	return buf, nil
+}
+
+// PCMFloatBuffer populates the passed float buffer and returns the number of
+// samples read. fl32/FL32 samples are decoded as is, without any scaling.
+// Integer PCM containers are also supported and their samples are converted to
+// float without normalization.
+//
+// A partial frame at the end of the PCM data is reported with
+// ErrTruncatedPCM and the incomplete frame is not returned.
+func (d *Decoder) PCMFloatBuffer(buf *audio.FloatBuffer) (n int, err error) {
+	if buf == nil {
+		return 0, nil
+	}
+	if d == nil {
+		return 0, errors.New("can't decode with a nil decoder")
+	}
+	if !d.WasPCMAccessed() {
+		if err := d.FwdToPCM(); err != nil {
+			return 0, err
+		}
+	}
+	if d.NumChans < 1 {
+		return 0, fmt.Errorf("%w: invalid number of channels %d", ErrUnexpectedData, d.NumChans)
+	}
+	if buf.Format != nil && buf.Format.NumChannels != 0 && buf.Format.NumChannels != int(d.NumChans) {
+		return 0, fmt.Errorf("%w: buffer has %d channels, decoder has %d", ErrBufferMismatch, buf.Format.NumChannels, d.NumChans)
+	}
+
+	decodeF, sampleSize, err := d.floatDecodeFunc()
+	if err != nil {
+		return 0, err
+	}
+
+	// only read complete frames, a partial frame is left untouched.
+	wanted := len(buf.Data) / int(d.NumChans) * int(d.NumChans)
+	if wanted == 0 {
+		return 0, nil
+	}
+	tmp := make([]byte, wanted*sampleSize)
+	// PCMSize excludes the SSND offset and any chunk padding, don't decode
+	// them as samples.
+	var r io.Reader = d.PCMChunk
+	if d.PCMSize > 0 {
+		r = io.LimitReader(d.PCMChunk, int64(d.PCMSize))
+	}
+	m, readErr := io.ReadFull(r, tmp)
+	if readErr != nil && readErr != io.EOF && readErr != io.ErrUnexpectedEOF {
+		return 0, readErr
+	}
+	// complete frames are always decoded, even when the PCM data ends with an
+	// incomplete one. The truncation is reported alongside the samples.
+	complete := m / sampleSize / int(d.NumChans) * int(d.NumChans)
+	truncated := false
+	if m%sampleSize != 0 || m/sampleSize%int(d.NumChans) != 0 {
+		truncated = true
+	}
+	bufR := bytes.NewReader(tmp[:complete*sampleSize])
+	var samples int
+	for samples = 0; samples < complete; samples++ {
+		v, decErr := decodeF(bufR)
+		if decErr != nil {
+			return samples, decErr
+		}
+		buf.Data[samples] = v
+	}
+	buf.Format = &audio.Format{
+		NumChannels: int(d.NumChans),
+		SampleRate:  int(d.SampleRate),
+	}
+	if truncated {
+		return samples, fmt.Errorf("%w: PCM data ends in the middle of a frame", ErrTruncatedPCM)
+	}
+	return samples, nil
+}
+
+// floatDecodeFunc returns a function reading a single float64 sample from the
+// PCM data along with the number of bytes per sample.
+func (d *Decoder) floatDecodeFunc() (func(io.Reader) (float64, error), int, error) {
+	if d.isFloatEncoding() {
+		if d.BitDepth != 32 {
+			return nil, 0, fmt.Errorf("%w: %q requires 32 bit samples, got %d", ErrFmtNotSupported, d.Encoding, d.BitDepth)
+		}
+		// fl32/FL32 samples are big endian IEEE 754 single precision values.
+		return func(r io.Reader) (float64, error) {
+			var bits uint32
+			if err := binary.Read(r, binary.BigEndian, &bits); err != nil {
+				return 0, err
+			}
+			return float64(math.Float32frombits(bits)), nil
+		}, 4, nil
+	}
+	f, err := sampleFloat64DecodeFunc(int(d.BitDepth), d.byteOrder)
+	if err != nil {
+		return nil, 0, err
+	}
+	return f, bytesPerSample(int(d.BitDepth)), nil
 }
 
 // String implements the Stringer interface.
@@ -743,22 +902,18 @@ func sampleFloat64DecodeFunc(bitDepth int, byteOrder binary.ByteOrder) (func(io.
 		}, nil
 	case 24:
 		return func(r io.Reader) (float64, error) {
-			// TODO: check if the conversion might not be inversed depending on
-			// the encoding (BE vs LE)
-			var output int32
 			d := make([]byte, 3)
-			_, err := r.Read(d)
-			if err != nil {
+			if _, err := io.ReadFull(r, d); err != nil {
 				return 0, err
 			}
-			output |= int32(d[2]) << 0
-			output |= int32(d[1]) << 8
-			output |= int32(d[0]) << 16
-			return float64(output), nil
+			if byteOrder == binary.LittleEndian {
+				return float64(audio.Int24LETo32(d)), nil
+			}
+			return float64(audio.Int24BETo32(d)), nil
 		}, nil
 	case 32:
 		return func(r io.Reader) (float64, error) {
-			var v float32
+			var v int32
 			err := binary.Read(r, byteOrder, &v)
 			return float64(v), err
 		}, nil
