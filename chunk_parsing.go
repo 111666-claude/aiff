@@ -40,6 +40,16 @@ func (d *Decoder) parseChunk(chunk *Chunk) error {
 		if err := d.parseCommentsChunk(chunk); err != nil {
 			fmt.Println("failed to read comments", err)
 		}
+	// Marker Chunk
+	case MARKID:
+		if err := d.parseMarkersChunk(chunk); err != nil {
+			return err
+		}
+	// Instrument Chunk
+	case INSTID:
+		if err := d.parseInstrumentChunk(chunk); err != nil {
+			return err
+		}
 	// Apple/Logic specific chunk
 	case bascID:
 		if err := d.parseBascChunk(chunk); err != nil {

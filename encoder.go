@@ -17,6 +17,14 @@ type Encoder struct {
 	BitDepth   int
 	NumChans   int
 
+	// Markers, when set before the first Write call, are serialized as a MARK
+	// chunk right after the COMM chunk.
+	Markers []Marker
+	// Instrument, when set before the first Write call, is serialized as an
+	// INST chunk after the MARK chunk. Its loops are validated against
+	// Markers when the header is written.
+	Instrument *Instrument
+
 	WrittenBytes    int
 	frames          int
 	pcmChunkStarted bool
@@ -132,6 +140,17 @@ func (e *Encoder) writeHeader() error {
 	// sample rate in IeeeFloat (10 bytes)
 	if err := e.AddBE(audio.IntToIEEEFloat(int(e.SampleRate))); err != nil {
 		return fmt.Errorf("%v when writing comm sample rate", err)
+	}
+	// optional MARK and INST chunks, written between COMM and SSND
+	if len(e.Markers) > 0 {
+		if err := e.writeMarkersChunk(); err != nil {
+			return err
+		}
+	}
+	if e.Instrument != nil {
+		if err := e.writeInstrumentChunk(); err != nil {
+			return err
+		}
 	}
 	return nil
 }

@@ -41,6 +41,11 @@ type Decoder struct {
 	//
 	Comments []string
 
+	// Markers contains the cue points defined in the MARK chunk (if any).
+	Markers []Marker
+	// Instrument contains the INST chunk data, nil if the file has no INST chunk.
+	Instrument *Instrument
+
 	// AIFC data
 	Encoding     [4]byte
 	EncodingName string
@@ -206,18 +211,23 @@ func (d *Decoder) Drain() error {
 		chunk, d.err = d.NextChunk()
 		if d.err != nil {
 			if d.err == io.EOF {
-				return nil
+				break
 			}
 			return d.err
 		}
 		if err := d.parseChunk(chunk); err != nil {
 			if err == io.EOF {
-				return nil
+				break
 			}
 			return err
 		}
 	}
-	return d.err
+	if d.err != nil && d.err != io.EOF {
+		return d.err
+	}
+	// the MARK chunk is allowed to appear after the INST chunk, the loop
+	// marker references can only be checked once everything was parsed.
+	return d.validateInstrumentRefs()
 }
 
 // FwdToPCM forwards the underlying reader until the start of the PCM chunk.
@@ -291,6 +301,8 @@ func (d *Decoder) Reset() {
 	d.SampleRate = 0
 	d.Encoding = [4]byte{}
 	d.EncodingName = ""
+	d.Markers = nil
+	d.Instrument = nil
 	d.err = nil
 	d.pcmDataAccessed = false
 	d.r.Seek(0, 0)

@@ -10,6 +10,10 @@ var (
 	COMMID = [4]byte{'C', 'O', 'M', 'M'}
 	COMTID = [4]byte{'C', 'O', 'M', 'T'}
 	SSNDID = [4]byte{'S', 'S', 'N', 'D'}
+	// MARKID is the marker chunk ID
+	MARKID = [4]byte{'M', 'A', 'R', 'K'}
+	// INSTID is the instrument chunk ID
+	INSTID = [4]byte{'I', 'N', 'S', 'T'}
 
 	// Apple stuff
 	chanID = [4]byte{'C', 'H', 'A', 'N'}
