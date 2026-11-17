@@ -7,5 +7,8 @@
 
 Support for int PCM data wrapped in aiff format.
 AIFC/sowt format supported.
+AIFC G.711 μ-law ("ulaw"/"ULAW") decoding and encoding is supported: 8 bit
+code words decode to 16 bit linear PCM and 16 bit PCM can be written as a
+μ-law AIFC file.
 
 See [GoDoc](https://godoc.org/github.com/go-audio/aiff) for more details and examples.

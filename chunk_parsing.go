@@ -34,6 +34,14 @@ func (d *Decoder) parseChunk(chunk *Chunk) error {
 		}
 	// audio content, should be read a different way
 	case SSNDID:
+		// Validate the SSND header and its consistency with the COMM chunk.
+		// The sample data itself is read by FwdToPCM.
+		if d.PCMChunk == nil {
+			if err := d.parseSSNDChunk(chunk); err != nil {
+				d.err = err
+				return err
+			}
+		}
 		chunk.Done()
 	// Comments Chunk
 	case COMTID:

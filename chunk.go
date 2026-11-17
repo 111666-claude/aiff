@@ -18,8 +18,21 @@ import (
 type Chunk struct {
 	ID   [4]byte
 	Size int
-	R    io.Reader
-	Pos  int
+	// DeclaredSize is the chunk size exactly as stored in the file, before
+	// the alignment to an even byte count. It is 0 when unknown, in which
+	// case Size should be used.
+	DeclaredSize int
+	R            io.Reader
+	Pos          int
+}
+
+// declaredSize returns the chunk size as declared by the file, falling back
+// to the aligned Size when the declared size wasn't recorded.
+func (ch *Chunk) declaredSize() int {
+	if ch.DeclaredSize > 0 {
+		return ch.DeclaredSize
+	}
+	return ch.Size
 }
 
 // Done makes sure the entire chunk was read.
