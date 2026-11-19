@@ -7,5 +7,7 @@
 
 Support for int PCM data wrapped in aiff format.
 AIFC/sowt format supported.
+AIFC `ima4` (Apple/QuickTime IMA ADPCM) is decoded to 16-bit linear PCM,
+including stereo packet interleaving and per-packet predictor resets.
 
 See [GoDoc](https://godoc.org/github.com/go-audio/aiff) for more details and examples.

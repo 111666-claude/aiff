@@ -20,6 +20,11 @@ type Chunk struct {
 	Size int
 	R    io.Reader
 	Pos  int
+
+	// declaredSize is the ckDataSize written in the chunk header. It excludes
+	// the AIFF pad byte that Size includes for odd sized chunks, so it is the
+	// size to validate packed payloads (such as IMA4 packets) against.
+	declaredSize int
 }
 
 // Done makes sure the entire chunk was read.

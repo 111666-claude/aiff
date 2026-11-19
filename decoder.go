@@ -45,6 +45,19 @@ type Decoder struct {
 	Encoding     [4]byte
 	EncodingName string
 
+	// IMA4 decoding state: decoded samples waiting to be delivered, how many
+	// samples were produced so far (to honor the COMM frame count) and whether
+	// the payload has been exhausted.
+	ima4Pending    []int
+	ima4PendingOff int
+	ima4Produced   int
+	ima4Finished   bool
+	// ima4DataSize is the number of packet bytes in the SSND chunk: the
+	// chunk payload minus its 8 byte offset/block-size header, its offset
+	// padding and any alignment pad byte the chunk declared outside its
+	// payload.
+	ima4DataSize int64
+
 	// Apple specific
 	HasAppleInfo bool
 	AppleInfo    AppleMetadata
@@ -66,9 +79,14 @@ func NewDecoder(r io.ReadSeeker) *Decoder {
 }
 
 // SampleBitDepth returns the bit depth encoding of each sample.
+// For IMA4 the COMM sample size describes the original pre-compression data,
+// while the decoder always produces 16 bit linear samples.
 func (d *Decoder) SampleBitDepth() int32 {
 	if d == nil {
 		return 0
+	}
+	if d.isIMA4() {
+		return ima4BitDepth
 	}
 	return int32(d.BitDepth)
 }
@@ -120,7 +138,7 @@ func (d *Decoder) Format() *audio.Format {
 func (d *Decoder) NextChunk() (*Chunk, error) {
 	// we need to read the info so we have access to the encoding.
 	if d.ReadInfo(); d.err != nil {
-		d.err = fmt.Errorf("failed to read info - %v", d.err)
+		d.err = fmt.Errorf("failed to read info - %w", d.err)
 		return nil, d.err
 	}
 
@@ -130,6 +148,7 @@ func (d *Decoder) NextChunk() (*Chunk, error) {
 	)
 
 	id, size, d.err = d.iDnSize()
+	declaredSize := size
 	if size%2 != 0 {
 		// realign, the encoder lied about the size of the chunk header :(
 		size++
@@ -142,9 +161,10 @@ func (d *Decoder) NextChunk() (*Chunk, error) {
 	}
 
 	c := &Chunk{
-		ID:   id,
-		Size: int(size),
-		R:    io.LimitReader(d.r, int64(size)),
+		ID:           id,
+		Size:         int(size),
+		declaredSize: int(declaredSize),
+		R:            io.LimitReader(d.r, int64(size)),
 	}
 
 	return c, d.err
@@ -155,6 +175,14 @@ func (d *Decoder) IsValidFile() bool {
 	d.ReadInfo()
 	if d.err != nil {
 		return false
+	}
+	if d.isIMA4() {
+		// The duration comes from COMM, so a zero frame count would look
+		// invalid even though the payload can be decoded; validate the
+		// encoding specific constraints directly instead.
+		return d.validateIMA4Comm() == nil &&
+			d.NumSampleFrames > 0 &&
+			d.SampleRate > 0
 	}
 	if d.NumChans < 1 {
 		return false
@@ -232,7 +260,7 @@ func (d *Decoder) FwdToPCM() error {
 	for d.err == nil {
 		chunk, d.err = d.NextChunk()
 		if d.err != nil {
-			d.err = fmt.Errorf("failed to read next chunk: %v", d.err)
+			d.err = fmt.Errorf("failed to read next chunk: %w", d.err)
 			return d.err
 		}
 
@@ -264,6 +292,21 @@ func (d *Decoder) FwdToPCM() error {
 					return d.err
 				}
 			}
+			if d.isIMA4() {
+				// The SSND payload holds an 8 byte offset/block-size header,
+				// the offset's padding, then the packet data. The declared
+				// chunk size excludes the AIFF alignment pad byte, which the
+				// decoder must not mistake for packet data.
+				if err := d.validateIMA4Comm(); err != nil {
+					d.err = err
+					return err
+				}
+				d.ima4DataSize = int64(chunk.declaredSize) - 8 - int64(offset)
+				if err := d.validateIMA4Payload(); err != nil {
+					d.err = err
+					return err
+				}
+			}
 			d.PCMChunk = chunk
 			d.pcmDataAccessed = true
 			if d.err != nil {
@@ -273,7 +316,7 @@ func (d *Decoder) FwdToPCM() error {
 		}
 
 		if err := d.parseChunk(chunk); err != nil {
-			return fmt.Errorf("failed to parse the chunk - %v", err)
+			return fmt.Errorf("failed to parse the chunk - %w", err)
 		}
 	}
 	return d.err
@@ -291,6 +334,11 @@ func (d *Decoder) Reset() {
 	d.SampleRate = 0
 	d.Encoding = [4]byte{}
 	d.EncodingName = ""
+	d.ima4Pending = nil
+	d.ima4PendingOff = 0
+	d.ima4Produced = 0
+	d.ima4Finished = false
+	d.ima4DataSize = 0
 	d.err = nil
 	d.pcmDataAccessed = false
 	d.r.Seek(0, 0)
@@ -315,8 +363,11 @@ func (d *Decoder) FullPCMBuffer() (*audio.IntBuffer, error) {
 	if !d.WasPCMAccessed() {
 		err := d.FwdToPCM()
 		if err != nil {
-			return nil, fmt.Errorf("failed to forward to PCM: %v", err)
+			return nil, fmt.Errorf("failed to forward to PCM: %w", err)
 		}
+	}
+	if d.isIMA4() {
+		return d.fullIMA4Buffer()
 	}
 	format := &audio.Format{
 		NumChannels: int(d.NumChans),
@@ -400,6 +451,9 @@ func (d *Decoder) PCMBuffer(buf *audio.IntBuffer) (n int, err error) {
 		if err != nil {
 			return 0, err
 		}
+	}
+	if d.isIMA4() {
+		return d.readIMA4(buf)
 	}
 
 	// TODO: avoid a potentially unecessary allocation
@@ -619,20 +673,20 @@ func (d *Decoder) parseCommChunk(size uint32) error {
 	}
 
 	if d.err = binary.Read(src, binary.BigEndian, &d.NumChans); d.err != nil {
-		d.err = fmt.Errorf("num of channels failed to parse - %s", d.err)
+		d.err = fmt.Errorf("%w: num of channels failed to parse - %v", ErrInvalidCOMM, d.err)
 		return d.err
 	}
 	if d.err = binary.Read(src, binary.BigEndian, &d.NumSampleFrames); d.err != nil {
-		d.err = fmt.Errorf("num of sample frames failed to parse - %s", d.err)
+		d.err = fmt.Errorf("%w: num of sample frames failed to parse - %v", ErrInvalidCOMM, d.err)
 		return d.err
 	}
 	if d.err = binary.Read(src, binary.BigEndian, &d.BitDepth); d.err != nil {
-		d.err = fmt.Errorf("sample size failed to parse - %s", d.err)
+		d.err = fmt.Errorf("%w: sample size failed to parse - %v", ErrInvalidCOMM, d.err)
 		return d.err
 	}
 	var srBytes [10]byte
 	if d.err = binary.Read(src, binary.BigEndian, &srBytes); d.err != nil {
-		d.err = fmt.Errorf("sample rate failed to parse - %s", d.err)
+		d.err = fmt.Errorf("%w: sample rate failed to parse - %v", ErrInvalidCOMM, d.err)
 		return d.err
 	}
 	d.SampleRate = audio.IEEEFloatToInt(srBytes)
@@ -641,7 +695,7 @@ func (d *Decoder) parseCommChunk(size uint32) error {
 
 	if d.Form == aifcID {
 		if d.err = binary.Read(src, binary.BigEndian, &d.Encoding); d.err != nil {
-			d.err = fmt.Errorf("AIFC encoding failed to parse - %s", d.err)
+			d.err = fmt.Errorf("%w: AIFC encoding failed to parse - %v", ErrInvalidCOMM, d.err)
 			return d.err
 		}
 		if d.Encoding == encSowt {
@@ -650,14 +704,14 @@ func (d *Decoder) parseCommChunk(size uint32) error {
 		// pascal style string with the description of the encoding
 		var encNameSize uint8
 		if d.err = binary.Read(src, binary.BigEndian, &encNameSize); d.err != nil {
-			d.err = fmt.Errorf("AIFC encoding failed to parse - %s", d.err)
+			d.err = fmt.Errorf("%w: AIFC encoding failed to parse - %v", ErrInvalidCOMM, d.err)
 			return d.err
 		}
 		read += 5
 		if encNameSize > 0 {
 			desc := make([]byte, encNameSize)
 			if d.err = binary.Read(src, binary.BigEndian, &desc); d.err != nil {
-				d.err = fmt.Errorf("AIFC encoding failed to parse - %s", d.err)
+				d.err = fmt.Errorf("%w: AIFC encoding failed to parse - %v", ErrInvalidCOMM, d.err)
 				return d.err
 			}
 			d.EncodingName = string(desc[:encNameSize])
